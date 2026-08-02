@@ -10,6 +10,7 @@ out/
 # Production
 build/
 dist
+_data
 
 # Env
 .env
@@ -37,6 +38,12 @@ Thumbs.db
 # ignore all the .md files except README.md
 *.md
 !README.md
+
+# ...but the user guide must be committed: docs/user-guide.md is served at
+# https://win.knk24.com/user-guide.md and is linked from the landing page,
+# and _data/User-Guide.md is the source it is generated from.
+!docs/*.md
+!_data/*.md
 
 # Ignore all .sql files
 *.sql

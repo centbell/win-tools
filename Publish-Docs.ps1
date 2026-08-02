@@ -32,7 +32,7 @@
 [CmdletBinding()]
 param(
     # Custom domain written to docs\CNAME when that file does not exist yet.
-    [string]$Domain = "win.mydomain.com"
+    [string]$Domain = "win.knk24.com"
 )
 
 Set-StrictMode -Version Latest
@@ -127,6 +127,23 @@ if ($IndexParseErrors.Count -gt 0) {
 }
 
 # ---------------------------------------------------------------------------
+# docs\user-guide.md - copy of the end-user manual so the site can link it
+# ---------------------------------------------------------------------------
+
+$GuideSource = Join-Path $RootDirectory "_data\User-Guide.md"
+
+if (Test-Path $GuideSource) {
+    $GuideTarget = Join-Path $DocsDirectory "user-guide.md"
+    [System.IO.File]::WriteAllText(
+        $GuideTarget, [System.IO.File]::ReadAllText($GuideSource), $Utf8NoBom
+    )
+    Write-Host "Wrote $GuideTarget" -ForegroundColor Green
+}
+else {
+    Write-Warning "_data\User-Guide.md not found; the site will link to a missing page."
+}
+
+# ---------------------------------------------------------------------------
 # Files created once, then left alone so hand edits survive
 # ---------------------------------------------------------------------------
 
@@ -211,6 +228,11 @@ if (-not (Test-Path $InstallPagePath)) {
     <li>64-bit Windows 10 or Windows 11.</li>
     <li>WinGet (Microsoft App Installer).</li>
     <li>Windows PowerShell 5.1 or PowerShell 7+.</li>
+  </ul>
+
+  <h2>More</h2>
+  <ul>
+    <li><a href="./user-guide.md">User guide</a> &mdash; every button, customising the app list, troubleshooting.</li>
   </ul>
 
   <footer>

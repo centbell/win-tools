@@ -1,0 +1,24 @@
+Common Apps Manager
+===========================================================================
+
+A window where you tick the apps you want, then click Install, Uninstall,
+or Update. Run it as Administrator.
+
+From the web:
+
+irm https://win.knk24.com | iex
+
+From this folder:
+
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\Install-Common-Apps-GUI.ps1"
+
+If execution policy blocks it, run this first (affects the current window
+only):
+
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+
+
+Full instructions
+---------------------------------------------------------------------------
+
+_data\User-Guide.md  (also served at https://win.knk24.com/user-guide.md)
