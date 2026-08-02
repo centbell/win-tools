@@ -39,11 +39,10 @@ Thumbs.db
 *.md
 !README.md
 
-# ...but the user guide must be committed: docs/user-guide.md is served at
-# https://win.knk24.com/user-guide.md and is linked from the landing page,
-# and _data/User-Guide.md is the source it is generated from.
+# ...but docs/user-guide.md must be committed: it is the hand-written user
+# guide, served at https://win.knk24.com/user-guide.md and linked from the
+# landing page. (_data/ stays ignored - it is personal, not part of the site.)
 !docs/*.md
-!_data/*.md
 
 # Ignore all .sql files
 *.sql

@@ -21,4 +21,4 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 Full instructions
 ---------------------------------------------------------------------------
 
-_data\User-Guide.md  (also served at https://win.knk24.com/user-guide.md)
+docs\user-guide.md  (also served at https://win.knk24.com/user-guide.md)

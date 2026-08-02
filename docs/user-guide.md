@@ -262,7 +262,9 @@ This regenerates the `docs\` folder from the script. Set your domain in
 `docs\CNAME`, commit, push, and point GitHub Pages at the `docs` folder
 (Settings > Pages > Source: main / /docs).
 
-Never edit `docs\index.html`, `docs\win.ps1`, or `docs\user-guide.md` by hand —
-they are generated, and your changes would be overwritten on the next publish.
-Edit `Install-Common-Apps-GUI.ps1` (or `_data\User-Guide.md` for this page) and
-republish instead.
+Never edit `docs\index.html` or `docs\win.ps1` by hand — they are generated from
+the script, and your changes would be overwritten on the next publish. Edit
+`Install-Common-Apps-GUI.ps1` and republish instead.
+
+This page (`docs\user-guide.md`) and `docs\install.html` are written by hand and
+are never overwritten, so edit them directly.

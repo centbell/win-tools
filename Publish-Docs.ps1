@@ -16,8 +16,12 @@
                          human-readable install page.
         docs\win.ps1     The same script at an explicit .ps1 URL.
 
-    Files that are safe to hand-edit (install.html, CNAME, .nojekyll) are only
-    created when missing, never overwritten.
+    Everything else in docs\ is hand-written and never touched by this script:
+    user-guide.md is authored directly, and install.html, CNAME, and .nojekyll
+    are only created when missing.
+
+    This script never reads from _data\, which is a personal scratch folder and
+    is not part of the published site.
 
     Everything is written as UTF-8 without a BOM. A BOM would end up at the
     start of the string 'irm' returns and break 'iex'.
@@ -127,20 +131,17 @@ if ($IndexParseErrors.Count -gt 0) {
 }
 
 # ---------------------------------------------------------------------------
-# docs\user-guide.md - copy of the end-user manual so the site can link it
+# docs\user-guide.md - hand-written, never generated
 # ---------------------------------------------------------------------------
+#
+# The user guide is authored directly in docs\ and committed. This script does
+# not touch it. Nothing here reads from _data\, which is a personal scratch
+# folder, git-ignored, and deliberately kept out of the published site.
 
-$GuideSource = Join-Path $RootDirectory "_data\User-Guide.md"
+$GuidePath = Join-Path $DocsDirectory "user-guide.md"
 
-if (Test-Path $GuideSource) {
-    $GuideTarget = Join-Path $DocsDirectory "user-guide.md"
-    [System.IO.File]::WriteAllText(
-        $GuideTarget, [System.IO.File]::ReadAllText($GuideSource), $Utf8NoBom
-    )
-    Write-Host "Wrote $GuideTarget" -ForegroundColor Green
-}
-else {
-    Write-Warning "_data\User-Guide.md not found; the site will link to a missing page."
+if (-not (Test-Path $GuidePath)) {
+    Write-Warning "docs\user-guide.md is missing; the landing page links to it. Restore it from git."
 }
 
 # ---------------------------------------------------------------------------
