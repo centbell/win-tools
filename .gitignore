@@ -1,0 +1,52 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Next.js
+.next/
+out/
+
+# Production
+build/
+dist
+
+# Env
+.env
+.env.local
+.env.*.local
+
+# Debug
+npm-debug.log*
+pnpm-debug.log*
+
+# Turbo
+.turbo/
+
+# Vercel
+.vercel
+
+# TypeScript
+*.tsbuildinfo
+next-env.d.ts
+
+# OS
+.DS_Store
+Thumbs.db
+
+# ignore all the .md files except README.md
+*.md
+!README.md
+
+# Ignore all .sql files
+*.sql
+
+nul
+
+tmpclaude-*-cwd
+tmpclaude-*-cwd/
+tmpclaude-*/
+.claude/
+/.hintrc
+/_temp
+/data

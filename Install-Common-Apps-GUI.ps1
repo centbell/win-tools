@@ -1,0 +1,1166 @@
+#Requires -Version 5.1
+
+<#
+.SYNOPSIS
+    WPF GUI to install, uninstall, and update common applications via WinGet.
+
+.DESCRIPTION
+    Dark-themed, winutil-style companion to Install-Common-Apps-x64.ps1.
+    Check the apps you want, then click Install, Uninstall, or Update.
+    All WinGet work runs in a background runspace so the window stays
+    responsive, output streams into the log panel, and everything is also
+    written to a log file under %TEMP%\Winget-App-Installer.
+
+.EXAMPLE
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\Install-Common-Apps-GUI.ps1"
+#>
+
+[CmdletBinding()]
+param()
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Continue"
+
+# ---------------------------------------------------------------------------
+# STA guard and assemblies (WPF requires a single-threaded apartment)
+# ---------------------------------------------------------------------------
+
+# NOTE: 'exit' would close the whole console when this script is run via
+# 'iex' (e.g. 'irm <url> | iex' or 'gc script.ps1 -Raw | iex'), because there
+# is no script file scope to exit from. $PSCommandPath is empty in that case,
+# so each early-exit below uses 'return' instead when running under iex.
+
+if ([Threading.Thread]::CurrentThread.ApartmentState -ne "STA") {
+    if ([string]::IsNullOrEmpty($PSCommandPath)) {
+        Write-Warning "WPF requires an STA session. Start PowerShell without -MTA and run this again."
+        return
+    }
+
+    Start-Process powershell.exe -ArgumentList @(
+        "-NoProfile", "-ExecutionPolicy", "Bypass", "-STA",
+        "-File", "`"$PSCommandPath`""
+    )
+    exit 0
+}
+
+Add-Type -AssemblyName PresentationFramework
+Add-Type -AssemblyName PresentationCore
+Add-Type -AssemblyName WindowsBase
+
+# ---------------------------------------------------------------------------
+# System checks
+# ---------------------------------------------------------------------------
+
+if (-not [Environment]::Is64BitOperatingSystem) {
+    [Windows.MessageBox]::Show(
+        "This tool is intended for a 64-bit Windows system.",
+        "Common Apps Manager", "OK", "Error"
+    ) | Out-Null
+    if ($PSCommandPath) { exit 1 } else { return }
+}
+
+$WingetCommand = Get-Command winget.exe -ErrorAction SilentlyContinue
+
+if (-not $WingetCommand) {
+    [Windows.MessageBox]::Show(
+        "WinGet was not found.`n`nInstall or update Microsoft App Installer, then run this tool again.",
+        "Common Apps Manager", "OK", "Error"
+    ) | Out-Null
+    if ($PSCommandPath) { exit 1 } else { return }
+}
+
+$CurrentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$Principal = New-Object Security.Principal.WindowsPrincipal($CurrentIdentity)
+$IsAdministrator = $Principal.IsInRole(
+    [Security.Principal.WindowsBuiltInRole]::Administrator
+)
+
+# ---------------------------------------------------------------------------
+# Shared state between the UI thread and the background runspace
+# ---------------------------------------------------------------------------
+
+# Must be global: the dispatcher closures (.GetNewClosure()) resolve $sync
+# through their module scope straight to the global scope, skipping the
+# script scope. Script-scoped, $sync would be $null inside those closures
+# when the script is invoked as '.\script.ps1'.
+$global:sync = [Hashtable]::Synchronized(@{})
+$sync.Winget = $WingetCommand.Source
+$sync.IsAdministrator = $IsAdministrator
+$sync.ProcessRunning = $false
+$sync.InstalledMap = [Hashtable]::Synchronized(@{})
+$sync.AppControls = @{}
+$sync.CategoryHeaders = @{}
+$sync.CategoryPanels = @{}
+$sync.ColumnCount = 3
+$sync.ButtonsVertical = $false
+$sync.CurrentTask = $null
+
+$LogDirectory = Join-Path $env:TEMP "Winget-App-Installer"
+New-Item -Path $LogDirectory -ItemType Directory -Force | Out-Null
+$sync.LogFile = Join-Path $LogDirectory (
+    "GUI-{0}.log" -f (Get-Date -Format "yyyy-MM-dd_HH-mm-ss")
+)
+
+# ===========================================================================
+# EDIT YOUR APP LIST HERE
+# ---------------------------------------------------------------------------
+# Name        : label shown in the UI
+# Id          : exact WinGet package ID (winget search <name>), or the DISM
+#               feature name when Type is "Feature"
+# Source      : "winget" or "msstore" (ignored for Type = "Feature")
+# Category    : group header in the UI (apps are grouped in list order)
+# DetectNames : registry DisplayName wildcard patterns for detection
+# AppxPattern : Appx/Store package name pattern, or $null
+# Type        : optional. Omit for normal WinGet packages. Use "Feature" for
+#               Windows optional features installed through DISM instead of
+#               WinGet (these require Administrator).
+# ===========================================================================
+
+$sync.Apps = @(
+    [PSCustomObject]@{ Name = "Google Chrome";                Id = "Google.Chrome";                Source = "winget";  Category = "Browsers";            DetectNames = @("Google Chrome*");                                        AppxPattern = $null }
+    [PSCustomObject]@{ Name = "Brave Browser";                Id = "Brave.Brave";                  Source = "winget";  Category = "Browsers";            DetectNames = @("Brave*");                                                AppxPattern = $null }
+    [PSCustomObject]@{ Name = "Waterfox";                     Id = "Waterfox.Waterfox";            Source = "winget";  Category = "Browsers";            DetectNames = @("Waterfox*");                                             AppxPattern = $null }
+    [PSCustomObject]@{ Name = "Zen Browser";                  Id = "Zen-Team.Zen-Browser";         Source = "winget";  Category = "Browsers";            DetectNames = @("Zen Browser*");                                          AppxPattern = $null }
+    [PSCustomObject]@{ Name = "LibreWolf";                    Id = "LibreWolf.LibreWolf";          Source = "winget";  Category = "Browsers";            DetectNames = @("LibreWolf*");                                            AppxPattern = $null }
+    [PSCustomObject]@{ Name = "Helium";                       Id = "ImputNet.Helium";              Source = "winget";  Category = "Browsers";            DetectNames = @("Helium*");                                               AppxPattern = $null }
+
+    [PSCustomObject]@{ Name = "WhatsApp";                     Id = "9NKSQGP7F2NH";                 Source = "msstore"; Category = "Communication";       DetectNames = @("WhatsApp*");                                             AppxPattern = "*WhatsApp*" }
+    [PSCustomObject]@{ Name = "Telegram Desktop";             Id = "Telegram.TelegramDesktop";     Source = "winget";  Category = "Communication";       DetectNames = @("Telegram Desktop*");                                     AppxPattern = $null }
+
+    [PSCustomObject]@{ Name = "AnyDesk";                      Id = "AnyDesk.AnyDesk";              Source = "winget";  Category = "Remote Access";       DetectNames = @("AnyDesk*");                                              AppxPattern = $null }
+    [PSCustomObject]@{ Name = "UltraViewer";                  Id = "DucFabulous.UltraViewer";      Source = "winget";  Category = "Remote Access";       DetectNames = @("UltraViewer*");                                          AppxPattern = $null }
+
+    [PSCustomObject]@{ Name = "Dropbox";                      Id = "Dropbox.Dropbox";              Source = "winget";  Category = "Cloud Storage";       DetectNames = @("Dropbox*");                                              AppxPattern = $null }
+    [PSCustomObject]@{ Name = "Google Drive";                 Id = "Google.GoogleDrive";           Source = "winget";  Category = "Cloud Storage";       DetectNames = @("Google Drive*");                                         AppxPattern = $null }
+    [PSCustomObject]@{ Name = "pCloud Drive";                 Id = "pCloudAG.pCloudDrive";         Source = "winget";  Category = "Cloud Storage";       DetectNames = @("pCloud*", "pCloud Drive*");                              AppxPattern = $null }
+
+    # Adobe: skip Reader when Acrobat Pro or another Acrobat install already
+    # exists, avoiding Adobe error 1603 conflicts.
+    [PSCustomObject]@{ Name = "Adobe Acrobat Reader 64-bit";  Id = "Adobe.Acrobat.Reader.64-bit";  Source = "winget";  Category = "Documents & Editors"; DetectNames = @("Adobe Acrobat*", "Adobe Acrobat Reader*", "Adobe Reader*"); AppxPattern = $null }
+    [PSCustomObject]@{ Name = "Simplenote";                   Id = "Automattic.Simplenote";        Source = "winget";  Category = "Documents & Editors"; DetectNames = @("Simplenote*");                                           AppxPattern = $null }
+    [PSCustomObject]@{ Name = "Sublime Text 4";               Id = "SublimeHQ.SublimeText.4";      Source = "winget";  Category = "Documents & Editors"; DetectNames = @("Sublime Text*");                                         AppxPattern = $null }
+
+    [PSCustomObject]@{ Name = "7-Zip";                        Id = "7zip.7zip";                    Source = "winget";  Category = "Utilities";           DetectNames = @("7-Zip*");                                                AppxPattern = $null }
+    [PSCustomObject]@{ Name = "WinRAR";                       Id = "RARLab.WinRAR";                Source = "winget";  Category = "Utilities";           DetectNames = @("WinRAR*");                                               AppxPattern = $null }
+    [PSCustomObject]@{ Name = "Lightshot";                    Id = "Skillbrains.Lightshot";        Source = "winget";  Category = "Utilities";           DetectNames = @("Lightshot*");                                            AppxPattern = $null }
+    [PSCustomObject]@{ Name = "LocalSend";                    Id = "LocalSend.LocalSend";          Source = "winget";  Category = "Utilities";           DetectNames = @("LocalSend*");                                            AppxPattern = "*LocalSend*" }
+    [PSCustomObject]@{ Name = "Files";                        Id = "FilesCommunity.Files";         Source = "winget";  Category = "Utilities";           DetectNames = @("Files*");                                                AppxPattern = "*Files*" }
+    [PSCustomObject]@{ Name = "Windows Terminal";             Id = "Microsoft.WindowsTerminal";    Source = "winget";  Category = "Utilities";           DetectNames = @("Windows Terminal*");                                     AppxPattern = "*WindowsTerminal*" }
+
+    # Windows optional features: installed with DISM, not WinGet. .NET 3.5 is
+    # the classic prompt older apps trigger ("An app on your PC needs the
+    # following Windows feature"). Requires Administrator and downloads from
+    # Windows Update.
+    [PSCustomObject]@{ Name = ".NET Framework 3.5 (2.0/3.0)";  Id = "NetFx3";                       Source = "feature"; Category = "Windows Features";    DetectNames = @();                                                        AppxPattern = $null; Type = "Feature" }
+)
+
+# ---------------------------------------------------------------------------
+# Detection helpers (ported from Install-Common-Apps-x64.ps1)
+# ---------------------------------------------------------------------------
+
+function Get-UninstallEntries {
+    $RegistryPaths = @(
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*",
+        "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*"
+    )
+
+    foreach ($RegistryPath in $RegistryPaths) {
+        $Items = Get-ItemProperty -Path $RegistryPath -ErrorAction SilentlyContinue
+
+        foreach ($Item in $Items) {
+            $DisplayNameProperty = $Item.PSObject.Properties["DisplayName"]
+
+            if (
+                $null -ne $DisplayNameProperty -and
+                -not [string]::IsNullOrWhiteSpace([string]$DisplayNameProperty.Value)
+            ) {
+                $Item
+            }
+        }
+    }
+}
+
+function Test-InstalledByRegistryName {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$Patterns
+    )
+
+    $Entries = @(Get-UninstallEntries)
+
+    foreach ($Pattern in $Patterns) {
+        foreach ($Entry in $Entries) {
+            $DisplayNameProperty = $Entry.PSObject.Properties["DisplayName"]
+
+            if (
+                $null -ne $DisplayNameProperty -and
+                [string]$DisplayNameProperty.Value -like $Pattern
+            ) {
+                return $true
+            }
+        }
+    }
+
+    return $false
+}
+
+function Get-AppType {
+    param(
+        [Parameter(Mandatory = $true)]
+        [PSCustomObject]$App
+    )
+
+    # Catalog entries omit Type for ordinary WinGet packages, and Set-StrictMode
+    # makes a direct $App.Type read throw when the property is absent.
+    $TypeProperty = $App.PSObject.Properties["Type"]
+
+    if ($null -ne $TypeProperty -and -not [string]::IsNullOrWhiteSpace([string]$TypeProperty.Value)) {
+        return [string]$TypeProperty.Value
+    }
+
+    return "Winget"
+}
+
+function Test-FeatureEnabled {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$FeatureName
+    )
+
+    # Preferred check, but DISM online queries need elevation.
+    try {
+        $Feature = Get-WindowsOptionalFeature -Online -FeatureName $FeatureName -ErrorAction Stop
+        return ($Feature.State -eq "Enabled")
+    }
+    catch {
+        # Non-elevated fallback for .NET 3.5 specifically: the NDP registry key
+        # is readable by standard users.
+        if ($FeatureName -eq "NetFx3") {
+            try {
+                $Ndp = Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v3.5" -ErrorAction Stop
+                $InstallProperty = $Ndp.PSObject.Properties["Install"]
+
+                if ($null -ne $InstallProperty -and [int]$InstallProperty.Value -eq 1) {
+                    return $true
+                }
+            }
+            catch {
+                # Key absent means the feature is not enabled.
+            }
+        }
+
+        return $false
+    }
+}
+
+function Test-InstalledByAppx {
+    param(
+        [AllowNull()]
+        [string]$Pattern
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Pattern)) {
+        return $false
+    }
+
+    try {
+        return $null -ne (
+            Get-AppxPackage -Name $Pattern -ErrorAction SilentlyContinue |
+                Select-Object -First 1
+        )
+    }
+    catch {
+        return $false
+    }
+}
+
+# ---------------------------------------------------------------------------
+# GUI helpers (safe to call from the background runspace)
+# ---------------------------------------------------------------------------
+
+function Write-GuiLog {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string]$Message,
+
+        [switch]$NoTimestamp
+    )
+
+    if ($NoTimestamp) {
+        $Line = $Message
+    }
+    else {
+        $Line = "[{0}] {1}" -f (Get-Date -Format "HH:mm:ss"), $Message
+    }
+
+    try {
+        Add-Content -Path $sync.LogFile -Value $Line -Encoding UTF8 -ErrorAction SilentlyContinue
+    }
+    catch {
+        # File logging is best effort; the UI log panel still gets the line.
+    }
+
+    $sync.Form.Dispatcher.Invoke([action]{
+        $sync.LogBox.AppendText($Line + [Environment]::NewLine)
+        $sync.LogBox.ScrollToEnd()
+    }.GetNewClosure())
+}
+
+function Set-UiBusy {
+    param(
+        [Parameter(Mandatory = $true)]
+        [bool]$Busy,
+
+        [string]$Status = ""
+    )
+
+    $sync.ProcessRunning = $Busy
+
+    $sync.Form.Dispatcher.Invoke([action]{
+        foreach ($ButtonName in @("InstallBtn", "UninstallBtn", "UpdateBtn", "UpdateAllBtn", "RefreshBtn")) {
+            $sync[$ButtonName].IsEnabled = -not $Busy
+        }
+
+        if (-not [string]::IsNullOrEmpty($Status)) {
+            $sync.StatusText.Text = $Status
+        }
+    }.GetNewClosure())
+}
+
+function Set-AppStatus {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Id,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateSet("Installed", "NotInstalled", "Checking", "Working")]
+        [string]$State
+    )
+
+    if ($State -eq "Installed") { $sync.InstalledMap[$Id] = $true }
+    if ($State -eq "NotInstalled") { $sync.InstalledMap[$Id] = $false }
+
+    $sync.Form.Dispatcher.Invoke([action]{
+        $StatusControl = $sync.AppControls[$Id].Status
+
+        switch ($State) {
+            "Installed" {
+                $StatusControl.Text = [char]0x25CF + " Installed"
+                $StatusControl.Foreground = $sync.Brushes.Green
+            }
+            "NotInstalled" {
+                $StatusControl.Text = [char]0x25CB + " Not installed"
+                $StatusControl.Foreground = $sync.Brushes.Gray
+            }
+            "Checking" {
+                $StatusControl.Text = "checking..."
+                $StatusControl.Foreground = $sync.Brushes.Gray
+            }
+            "Working" {
+                $StatusControl.Text = "working..."
+                $StatusControl.Foreground = $sync.Brushes.Yellow
+            }
+        }
+    }.GetNewClosure())
+}
+
+# ---------------------------------------------------------------------------
+# Package workers (run inside the background runspace)
+# ---------------------------------------------------------------------------
+
+function Invoke-ProcessStreaming {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$FilePath,
+
+        [Parameter(Mandatory = $true)]
+        [string[]]$Arguments
+    )
+
+    $LastLine = ""
+
+    & $FilePath @Arguments 2>&1 | ForEach-Object {
+        $Line = $_.ToString()
+
+        # Strip backspaces, carriage returns, and ANSI escape sequences used by
+        # winget's progress spinner and DISM's progress bar.
+        $Line = $Line -replace "`b", "" -replace "`r", ""
+        $Line = $Line -replace "\x1b\[[0-9;]*[A-Za-z]", ""
+        $Line = $Line.Trim()
+
+        if ($Line -eq "") { return }
+        if ($Line -match "^[\-\\\|\/\s]+$") { return }
+        if ($Line -match "^[█▒░\s]") { return }
+        if ($Line -match "^\[=*\s*\d+([.,]\d+)?%") { return }
+        if ($Line -eq $LastLine) { return }
+
+        $LastLine = $Line
+        Write-GuiLog "    $Line" -NoTimestamp
+    }
+
+    return $LASTEXITCODE
+}
+
+function Invoke-WingetStreaming {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$Arguments
+    )
+
+    return (Invoke-ProcessStreaming -FilePath $sync.Winget -Arguments $Arguments)
+}
+
+function Update-InstalledStatus {
+    Set-UiBusy $true "Checking installed applications..."
+    Write-GuiLog "Checking installed applications..."
+
+    foreach ($App in $sync.Apps) {
+        Set-AppStatus -Id $App.Id -State "Checking"
+    }
+
+    # One bulk 'winget list' call instead of one call per app: much faster.
+    $ListOutput = ""
+    try {
+        $ListOutput = (
+            & $sync.Winget list --accept-source-agreements --disable-interactivity 2>$null
+        ) -join "`n"
+    }
+    catch {
+        Write-GuiLog "WARNING: 'winget list' failed; falling back to registry detection only."
+    }
+
+    foreach ($App in $sync.Apps) {
+        $Installed = $false
+
+        if ((Get-AppType -App $App) -eq "Feature") {
+            $Installed = Test-FeatureEnabled -FeatureName $App.Id
+        }
+        elseif ($ListOutput -match ("(?im)(^|\s){0}(\s|$)" -f [regex]::Escape($App.Id))) {
+            $Installed = $true
+        }
+        elseif (@($App.DetectNames).Count -gt 0 -and (Test-InstalledByRegistryName -Patterns $App.DetectNames)) {
+            $Installed = $true
+        }
+        elseif (Test-InstalledByAppx -Pattern $App.AppxPattern) {
+            $Installed = $true
+        }
+
+        if ($Installed) {
+            Set-AppStatus -Id $App.Id -State "Installed"
+        }
+        else {
+            Set-AppStatus -Id $App.Id -State "NotInstalled"
+        }
+    }
+
+    $InstalledCount = @($sync.Apps | Where-Object { $sync.InstalledMap[$_.Id] }).Count
+    Write-GuiLog "Status check complete: $InstalledCount of $($sync.Apps.Count) apps installed."
+    Set-UiBusy $false "Ready"
+}
+
+function Invoke-AppAction {
+    $Action = $sync.PendingAction
+    $Apps = @($sync.PendingApps)
+
+    Set-UiBusy $true "$Action in progress..."
+
+    $Succeeded = New-Object System.Collections.Generic.List[string]
+    $Skipped = New-Object System.Collections.Generic.List[string]
+    $Failed = New-Object System.Collections.Generic.List[string]
+
+    foreach ($App in $Apps) {
+        $AppType = Get-AppType -App $App
+
+        Write-GuiLog ("-" * 60) -NoTimestamp
+        Write-GuiLog "$Action : $($App.Name) [$($App.Id)] ($($App.Source))"
+        Set-UiBusy $true "$Action : $($App.Name)"
+
+        if ($Action -eq "Install" -and $sync.InstalledMap[$App.Id]) {
+            Write-GuiLog "$($App.Name) is already installed. Skipping."
+            $Skipped.Add($App.Name)
+            continue
+        }
+
+        if ($Action -eq "Update" -and -not $sync.InstalledMap[$App.Id]) {
+            Write-GuiLog "$($App.Name) is not installed. Skipping update."
+            $Skipped.Add($App.Name)
+            continue
+        }
+
+        # ---- Windows optional features take the DISM path, not WinGet ----
+        if ($AppType -eq "Feature") {
+            if ($Action -eq "Update") {
+                Write-GuiLog "$($App.Name) is a Windows feature and has no separate update. Skipping."
+                $Skipped.Add($App.Name)
+                continue
+            }
+
+            if (-not $sync.IsAdministrator) {
+                Write-GuiLog "ERROR: $($App.Name) requires Administrator. Restart this tool as Administrator."
+                $Failed.Add("$($App.Name) (needs Administrator)")
+                continue
+            }
+
+            Set-AppStatus -Id $App.Id -State "Working"
+
+            if ($Action -eq "Install") {
+                Write-GuiLog "Enabling Windows feature $($App.Id) (may download from Windows Update; this can take a few minutes)..."
+                $FeatureArguments = @(
+                    "/online", "/enable-feature", "/featurename:$($App.Id)",
+                    "/all", "/norestart", "/quiet"
+                )
+            }
+            else {
+                Write-GuiLog "Disabling Windows feature $($App.Id)..."
+                $FeatureArguments = @(
+                    "/online", "/disable-feature", "/featurename:$($App.Id)",
+                    "/norestart", "/quiet"
+                )
+            }
+
+            $FeatureExit = Invoke-ProcessStreaming -FilePath "$env:SystemRoot\System32\dism.exe" -Arguments $FeatureArguments
+
+            # 3010 means success but a reboot is required to complete.
+            if ($FeatureExit -eq 0 -or $FeatureExit -eq 3010) {
+                if ($FeatureExit -eq 3010) {
+                    Write-GuiLog "$($App.Name) : $Action completed. A RESTART IS REQUIRED to finish."
+                }
+                else {
+                    Write-GuiLog "$($App.Name) : $Action completed successfully."
+                }
+
+                $Succeeded.Add($App.Name)
+
+                if ($Action -eq "Uninstall") {
+                    Set-AppStatus -Id $App.Id -State "NotInstalled"
+                }
+                else {
+                    Set-AppStatus -Id $App.Id -State "Installed"
+                }
+            }
+            else {
+                Write-GuiLog "WARNING: $($App.Name) failed with DISM exit code $FeatureExit."
+
+                if ($App.Id -eq "NetFx3") {
+                    Write-GuiLog "NetFx3 note: if Windows Update is blocked by policy, enable it from Windows installation media instead:"
+                    Write-GuiLog "  dism /online /enable-feature /featurename:NetFx3 /all /source:D:\sources\sxs /limitaccess"
+                }
+
+                $Failed.Add("$($App.Name) (DISM exit code $FeatureExit)")
+
+                if ($sync.InstalledMap[$App.Id]) {
+                    Set-AppStatus -Id $App.Id -State "Installed"
+                }
+                else {
+                    Set-AppStatus -Id $App.Id -State "NotInstalled"
+                }
+            }
+
+            continue
+        }
+
+        Set-AppStatus -Id $App.Id -State "Working"
+
+        switch ($Action) {
+            "Install" {
+                $Arguments = @(
+                    "install", "--exact", "--id", $App.Id, "--source", $App.Source,
+                    "--accept-package-agreements", "--accept-source-agreements",
+                    "--disable-interactivity", "--silent"
+                )
+            }
+            "Uninstall" {
+                # No --source here: uninstall targets the installed package.
+                $Arguments = @(
+                    "uninstall", "--exact", "--id", $App.Id,
+                    "--accept-source-agreements", "--disable-interactivity", "--silent"
+                )
+            }
+            "Update" {
+                $Arguments = @(
+                    "upgrade", "--exact", "--id", $App.Id, "--source", $App.Source,
+                    "--accept-package-agreements", "--accept-source-agreements",
+                    "--disable-interactivity", "--silent"
+                )
+            }
+        }
+
+        $ExitCode = Invoke-WingetStreaming -Arguments $Arguments
+
+        if ($ExitCode -eq 0) {
+            Write-GuiLog "$($App.Name) : $Action completed successfully."
+            $Succeeded.Add($App.Name)
+
+            if ($Action -eq "Uninstall") {
+                Set-AppStatus -Id $App.Id -State "NotInstalled"
+            }
+            else {
+                Set-AppStatus -Id $App.Id -State "Installed"
+            }
+        }
+        elseif ($ExitCode -eq -1978334963) {
+            # MSI 1638: another version of this application is already installed.
+            Write-GuiLog "$($App.Name) is already installed in another version. Skipping."
+            $Skipped.Add($App.Name)
+            Set-AppStatus -Id $App.Id -State "Installed"
+        }
+        elseif ($ExitCode -eq -1978335189) {
+            # 0x8A15002B: no applicable update found.
+            Write-GuiLog "$($App.Name) is already up to date."
+            $Skipped.Add($App.Name)
+            Set-AppStatus -Id $App.Id -State "Installed"
+        }
+        else {
+            Write-GuiLog "WARNING: $($App.Name) failed with WinGet exit code $ExitCode."
+
+            if ($App.Id -eq "Adobe.Acrobat.Reader.64-bit") {
+                Write-GuiLog "Adobe note: error 1603 commonly indicates an existing or conflicting Acrobat installation."
+            }
+
+            $Failed.Add("$($App.Name) (exit code $ExitCode)")
+
+            if ($sync.InstalledMap[$App.Id]) {
+                Set-AppStatus -Id $App.Id -State "Installed"
+            }
+            else {
+                Set-AppStatus -Id $App.Id -State "NotInstalled"
+            }
+        }
+    }
+
+    Write-GuiLog ("=" * 60) -NoTimestamp
+    Write-GuiLog "$Action summary - Succeeded: $($Succeeded.Count), Skipped: $($Skipped.Count), Failed: $($Failed.Count)"
+
+    if ($Succeeded.Count -gt 0) { Write-GuiLog ("  + " + ($Succeeded -join ", ")) -NoTimestamp }
+    if ($Skipped.Count -gt 0) { Write-GuiLog ("  = " + ($Skipped -join ", ")) -NoTimestamp }
+    if ($Failed.Count -gt 0) { Write-GuiLog ("  - " + ($Failed -join ", ")) -NoTimestamp }
+
+    Write-GuiLog "Log file: $($sync.LogFile)"
+    Set-UiBusy $false "Ready"
+}
+
+# ---------------------------------------------------------------------------
+# Background runspace plumbing
+# ---------------------------------------------------------------------------
+
+$FunctionsToShare = @(
+    "Get-UninstallEntries",
+    "Test-InstalledByRegistryName",
+    "Test-InstalledByAppx",
+    "Get-AppType",
+    "Test-FeatureEnabled",
+    "Write-GuiLog",
+    "Set-UiBusy",
+    "Set-AppStatus",
+    "Invoke-ProcessStreaming",
+    "Invoke-WingetStreaming",
+    "Update-InstalledStatus",
+    "Invoke-AppAction"
+)
+
+$InitialSessionState = [InitialSessionState]::CreateDefault()
+
+foreach ($FunctionName in $FunctionsToShare) {
+    $FunctionEntry = New-Object System.Management.Automation.Runspaces.SessionStateFunctionEntry(
+        $FunctionName,
+        (Get-Command $FunctionName).Definition
+    )
+    $InitialSessionState.Commands.Add($FunctionEntry)
+}
+
+$InitialSessionState.Variables.Add((
+    New-Object System.Management.Automation.Runspaces.SessionStateVariableEntry(
+        "sync", $sync, "Synchronized state shared with the UI thread"
+    )
+))
+
+$sync.ISS = $InitialSessionState
+
+function Start-BackgroundTask {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Command
+    )
+
+    if ($sync.ProcessRunning) {
+        return
+    }
+
+    # Dispose the previous task's runspace once it has finished.
+    if ($null -ne $sync.CurrentTask -and $sync.CurrentTask.Handle.IsCompleted) {
+        try {
+            $sync.CurrentTask.PS.Dispose()
+            $sync.CurrentTask.Runspace.Dispose()
+        }
+        catch { }
+        $sync.CurrentTask = $null
+    }
+
+    $Runspace = [RunspaceFactory]::CreateRunspace($sync.ISS)
+    $Runspace.ApartmentState = "STA"
+    $Runspace.ThreadOptions = "ReuseThread"
+    $Runspace.Open()
+
+    $PowerShellInstance = [PowerShell]::Create()
+    $PowerShellInstance.Runspace = $Runspace
+
+    $WrappedCommand = @"
+try {
+    $Command
+}
+catch {
+    Write-GuiLog ("ERROR: " + `$_.Exception.Message)
+    Set-UiBusy `$false "Error - see log"
+}
+"@
+
+    $PowerShellInstance.AddScript($WrappedCommand) | Out-Null
+
+    $sync.CurrentTask = @{
+        PS = $PowerShellInstance
+        Runspace = $Runspace
+        Handle = $PowerShellInstance.BeginInvoke()
+    }
+}
+
+# ---------------------------------------------------------------------------
+# XAML
+# ---------------------------------------------------------------------------
+
+$XamlString = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Common Apps Manager"
+        Width="1000" Height="740" MinWidth="400" MinHeight="520"
+        WindowStartupLocation="CenterScreen"
+        Background="#FF1B1B1B">
+    <Window.Resources>
+        <Style TargetType="Button">
+            <Setter Property="Background" Value="#FF2D2D30"/>
+            <Setter Property="Foreground" Value="#FFF0F0F0"/>
+            <Setter Property="BorderBrush" Value="#FF3F3F46"/>
+            <Setter Property="Padding" Value="14,7"/>
+            <Setter Property="FontSize" Value="13"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="Bd"
+                                Background="{TemplateBinding Background}"
+                                BorderBrush="{TemplateBinding BorderBrush}"
+                                BorderThickness="1"
+                                CornerRadius="3"
+                                Padding="{TemplateBinding Padding}">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Bd" Property="Background" Value="#FF0078D4"/>
+                                <Setter TargetName="Bd" Property="BorderBrush" Value="#FF0078D4"/>
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter Property="Foreground" Value="#FF6E6E6E"/>
+                                <Setter TargetName="Bd" Property="Background" Value="#FF232323"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+        <Style TargetType="CheckBox">
+            <Setter Property="Foreground" Value="#FFF0F0F0"/>
+            <Setter Property="FontSize" Value="13"/>
+            <Setter Property="VerticalContentAlignment" Value="Center"/>
+        </Style>
+    </Window.Resources>
+
+    <Grid Margin="12">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="7*"/>
+            <RowDefinition Height="3*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <!-- Toolbar: search + select all / clear -->
+        <DockPanel Grid.Row="0" Margin="0,0,0,10">
+            <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+                <Button x:Name="SelectAllBtn" Content="Select All" Margin="8,0,0,0"/>
+                <Button x:Name="ClearBtn" Content="Clear" Margin="8,0,0,0"/>
+            </StackPanel>
+            <Grid>
+                <TextBox x:Name="SearchBox"
+                         Background="#FF2D2D30" Foreground="#FFF0F0F0"
+                         BorderBrush="#FF3F3F46" BorderThickness="1"
+                         FontSize="13" Padding="8,6"
+                         VerticalContentAlignment="Center"
+                         CaretBrush="#FFF0F0F0"/>
+                <TextBlock x:Name="SearchHint" Text="Search apps..."
+                           Foreground="#FF808080" FontSize="13"
+                           Margin="11,0,0,0" VerticalAlignment="Center"
+                           IsHitTestVisible="False"/>
+            </Grid>
+        </DockPanel>
+
+        <!-- App list -->
+        <Border Grid.Row="1" Background="#FF232323" BorderBrush="#FF3F3F46"
+                BorderThickness="1" CornerRadius="4">
+            <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="4">
+                <StackPanel x:Name="AppsPanel" Margin="10,6,10,10"/>
+            </ScrollViewer>
+        </Border>
+
+        <!-- Log panel -->
+        <Border Grid.Row="2" Background="#FF141414" BorderBrush="#FF3F3F46"
+                BorderThickness="1" CornerRadius="4" Margin="0,10,0,0">
+            <TextBox x:Name="LogBox"
+                     Background="Transparent" Foreground="#FFD4D4D4"
+                     BorderThickness="0"
+                     FontFamily="Consolas" FontSize="12"
+                     IsReadOnly="True" TextWrapping="Wrap"
+                     VerticalScrollBarVisibility="Auto"
+                     Padding="8"/>
+        </Border>
+
+        <!-- Action buttons + status -->
+        <DockPanel Grid.Row="3" Margin="0,12,0,0">
+            <TextBlock x:Name="StatusText" DockPanel.Dock="Right"
+                       Text="Starting..." Foreground="#FF9E9E9E"
+                       FontSize="13" VerticalAlignment="Center"/>
+            <StackPanel x:Name="ButtonsPanel" Orientation="Horizontal">
+                <Button x:Name="InstallBtn" Content="Install" Width="110" Margin="0,0,10,0"/>
+                <Button x:Name="UninstallBtn" Content="Uninstall" Width="110" Margin="0,0,10,0"/>
+                <Button x:Name="UpdateBtn" Content="Update" Width="110" Margin="0,0,10,0"/>
+                <Button x:Name="UpdateAllBtn" Content="Update All" Width="110" Margin="0,0,10,0"/>
+                <Button x:Name="RefreshBtn" Content="Refresh Status" Width="130"/>
+            </StackPanel>
+        </DockPanel>
+    </Grid>
+</Window>
+'@
+
+[xml]$XamlDocument = $XamlString
+$XamlNodeReader = New-Object System.Xml.XmlNodeReader $XamlDocument
+$sync.Form = [Windows.Markup.XamlReader]::Load($XamlNodeReader)
+
+foreach ($ControlName in @(
+    "SearchBox", "SearchHint", "SelectAllBtn", "ClearBtn", "AppsPanel",
+    "LogBox", "InstallBtn", "UninstallBtn", "UpdateBtn", "UpdateAllBtn",
+    "RefreshBtn", "StatusText", "ButtonsPanel"
+)) {
+    $sync[$ControlName] = $sync.Form.FindName($ControlName)
+}
+
+# Frozen brushes created on the UI thread so the background runspace can
+# safely assign them to controls via the dispatcher.
+$BrushConverter = New-Object Windows.Media.BrushConverter
+$sync.Brushes = @{}
+foreach ($BrushEntry in @(
+    @{ Key = "Green";  Hex = "#FF4CAF50" },
+    @{ Key = "Gray";   Hex = "#FF9E9E9E" },
+    @{ Key = "Yellow"; Hex = "#FFE0C341" },
+    @{ Key = "Header"; Hex = "#FF58A6FF" },
+    @{ Key = "Text";   Hex = "#FFF0F0F0" }
+)) {
+    $Brush = $BrushConverter.ConvertFromString($BrushEntry.Hex)
+    $Brush.Freeze()
+    $sync.Brushes[$BrushEntry.Key] = $Brush
+}
+
+# ---------------------------------------------------------------------------
+# Build the app rows, grouped by category
+# ---------------------------------------------------------------------------
+
+$CategoryOrder = @($sync.Apps | ForEach-Object { $_.Category } | Select-Object -Unique)
+
+foreach ($Category in $CategoryOrder) {
+    $Header = New-Object Windows.Controls.TextBlock
+    $Header.Text = $Category
+    $Header.FontSize = 14
+    $Header.FontWeight = "Bold"
+    $Header.Foreground = $sync.Brushes.Header
+    $Header.Margin = "0,10,0,4"
+
+    $sync.AppsPanel.Children.Add($Header) | Out-Null
+    $sync.CategoryHeaders[$Category] = $Header
+
+    # Apps in this category flow into a UniformGrid whose column count is
+    # adjusted responsively by Update-ResponsiveLayout (3 / 2 / 1 columns).
+    $CategoryGrid = New-Object Windows.Controls.Primitives.UniformGrid
+    $CategoryGrid.Columns = $sync.ColumnCount
+    $sync.AppsPanel.Children.Add($CategoryGrid) | Out-Null
+    $sync.CategoryPanels[$Category] = $CategoryGrid
+
+    foreach ($App in ($sync.Apps | Where-Object { $_.Category -eq $Category })) {
+        $Row = New-Object Windows.Controls.StackPanel
+        $Row.Orientation = "Horizontal"
+        $Row.Margin = "10,3,4,3"
+
+        $CheckBox = New-Object Windows.Controls.CheckBox
+        $CheckBox.Content = $App.Name
+        $CheckBox.Tag = $App.Id
+
+        $StatusText = New-Object Windows.Controls.TextBlock
+        $StatusText.Text = "checking..."
+        $StatusText.FontSize = 12
+        $StatusText.Foreground = $sync.Brushes.Gray
+        $StatusText.VerticalAlignment = "Center"
+        $StatusText.Margin = "10,0,0,0"
+
+        $Row.Children.Add($CheckBox) | Out-Null
+        $Row.Children.Add($StatusText) | Out-Null
+
+        # Rows are parented into their category grid by Update-AppLayout,
+        # which also handles search filtering and column changes.
+        $sync.AppControls[$App.Id] = @{
+            Row = $Row
+            CheckBox = $CheckBox
+            Status = $StatusText
+            Name = $App.Name
+            Category = $App.Category
+            Visible = $true
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Responsive layout (UI thread only)
+# ---------------------------------------------------------------------------
+
+function Update-AppLayout {
+    # Re-flow the app rows into their category grids, honoring the search
+    # filter and the current responsive column count. UniformGrid reserves
+    # cells for collapsed children, so filtered rows are removed instead.
+    foreach ($Category in $sync.CategoryPanels.Keys) {
+        $Panel = $sync.CategoryPanels[$Category]
+        $Panel.Children.Clear()
+        $Panel.Columns = $sync.ColumnCount
+
+        $AnyVisible = $false
+
+        foreach ($App in ($sync.Apps | Where-Object { $_.Category -eq $Category })) {
+            if ($sync.AppControls[$App.Id].Visible) {
+                $Panel.Children.Add($sync.AppControls[$App.Id].Row) | Out-Null
+                $AnyVisible = $true
+            }
+        }
+
+        if ($AnyVisible) {
+            $sync.CategoryHeaders[$Category].Visibility = [Windows.Visibility]::Visible
+        }
+        else {
+            $sync.CategoryHeaders[$Category].Visibility = [Windows.Visibility]::Collapsed
+        }
+    }
+}
+
+function Update-ResponsiveLayout {
+    $Width = $sync.Form.ActualWidth
+
+    if ([double]::IsNaN($Width) -or $Width -le 0) {
+        return
+    }
+
+    $NewColumnCount = if ($Width -ge 850) { 3 } elseif ($Width -ge 600) { 2 } else { 1 }
+
+    if ($NewColumnCount -ne $sync.ColumnCount) {
+        $sync.ColumnCount = $NewColumnCount
+        Update-AppLayout
+    }
+
+    $StackButtons = $Width -lt 660
+
+    if ($StackButtons -ne $sync.ButtonsVertical) {
+        $sync.ButtonsVertical = $StackButtons
+
+        if ($StackButtons) {
+            $sync.ButtonsPanel.Orientation = "Vertical"
+            $ButtonMargin = "0,0,0,8"
+        }
+        else {
+            $sync.ButtonsPanel.Orientation = "Horizontal"
+            $ButtonMargin = "0,0,10,0"
+        }
+
+        foreach ($ButtonName in @("InstallBtn", "UninstallBtn", "UpdateBtn", "UpdateAllBtn", "RefreshBtn")) {
+            $sync[$ButtonName].Margin = $ButtonMargin
+        }
+    }
+}
+
+Update-AppLayout
+
+# ---------------------------------------------------------------------------
+# UI-thread helpers and event handlers
+# ---------------------------------------------------------------------------
+
+function Get-VisibleApps {
+    @($sync.Apps | Where-Object {
+        $sync.AppControls[$_.Id].Visible
+    })
+}
+
+function Get-CheckedApps {
+    @($sync.Apps | Where-Object {
+        $sync.AppControls[$_.Id].CheckBox.IsChecked
+    })
+}
+
+function Start-AppAction {
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet("Install", "Uninstall", "Update")]
+        [string]$Action,
+
+        [object[]]$Apps
+    )
+
+    if ($sync.ProcessRunning) {
+        return
+    }
+
+    if ($null -eq $Apps) {
+        $Apps = Get-CheckedApps
+    }
+
+    if (@($Apps).Count -eq 0) {
+        [Windows.MessageBox]::Show(
+            "No applications selected.`n`nTick the checkbox next to each app first.",
+            "Common Apps Manager", "OK", "Information"
+        ) | Out-Null
+        return
+    }
+
+    if ($Action -eq "Uninstall") {
+        $AppNames = (@($Apps) | ForEach-Object { "  - $($_.Name)" }) -join "`n"
+        $Answer = [Windows.MessageBox]::Show(
+            "Uninstall the following applications?`n`n$AppNames",
+            "Confirm Uninstall", "YesNo", "Warning"
+        )
+
+        if ($Answer -ne [Windows.MessageBoxResult]::Yes) {
+            return
+        }
+    }
+
+    $sync.PendingAction = $Action
+    $sync.PendingApps = @($Apps)
+    Start-BackgroundTask -Command "Invoke-AppAction"
+}
+
+$sync.SearchBox.Add_TextChanged({
+    $Text = $sync.SearchBox.Text.Trim()
+
+    if ($Text -eq "") {
+        $sync.SearchHint.Visibility = [Windows.Visibility]::Visible
+    }
+    else {
+        $sync.SearchHint.Visibility = [Windows.Visibility]::Collapsed
+    }
+
+    foreach ($App in $sync.Apps) {
+        $sync.AppControls[$App.Id].Visible = ($Text -eq "") -or ($App.Name -like "*$Text*")
+    }
+
+    Update-AppLayout
+})
+
+$sync.SelectAllBtn.Add_Click({
+    foreach ($App in Get-VisibleApps) {
+        $sync.AppControls[$App.Id].CheckBox.IsChecked = $true
+    }
+})
+
+$sync.ClearBtn.Add_Click({
+    foreach ($App in Get-VisibleApps) {
+        $sync.AppControls[$App.Id].CheckBox.IsChecked = $false
+    }
+})
+
+$sync.InstallBtn.Add_Click({ Start-AppAction -Action "Install" })
+$sync.UninstallBtn.Add_Click({ Start-AppAction -Action "Uninstall" })
+$sync.UpdateBtn.Add_Click({ Start-AppAction -Action "Update" })
+
+$sync.UpdateAllBtn.Add_Click({
+    if ($sync.ProcessRunning) {
+        return
+    }
+
+    $InstalledApps = @($sync.Apps | Where-Object { $sync.InstalledMap[$_.Id] })
+
+    if ($InstalledApps.Count -eq 0) {
+        [Windows.MessageBox]::Show(
+            "No installed applications detected yet.`n`nRun Refresh Status first.",
+            "Common Apps Manager", "OK", "Information"
+        ) | Out-Null
+        return
+    }
+
+    Start-AppAction -Action "Update" -Apps $InstalledApps
+})
+
+$sync.RefreshBtn.Add_Click({
+    if (-not $sync.ProcessRunning) {
+        Start-BackgroundTask -Command "Update-InstalledStatus"
+    }
+})
+
+$sync.Form.Add_SizeChanged({
+    Update-ResponsiveLayout
+})
+
+$sync.Form.Add_ContentRendered({
+    Update-ResponsiveLayout
+
+    if ($sync.ProcessRunning) {
+        return
+    }
+
+    Write-GuiLog "Common Apps Manager started."
+    Write-GuiLog "WinGet: $(& $sync.Winget --version)"
+
+    if (-not $IsAdministrator) {
+        Write-GuiLog "WARNING: Not running as Administrator. Some machine-wide installers may request elevation or fail."
+        Write-GuiLog "WARNING: Windows Features (such as .NET Framework 3.5) cannot be enabled without Administrator."
+    }
+
+    Write-GuiLog "Log file: $($sync.LogFile)"
+    Start-BackgroundTask -Command "Update-InstalledStatus"
+})
+
+$sync.Form.Add_Closing({
+    param($EventSender, $EventArgs)
+
+    if ($sync.ProcessRunning) {
+        $Answer = [Windows.MessageBox]::Show(
+            "A task is still running. Close anyway?",
+            "Common Apps Manager", "YesNo", "Warning"
+        )
+
+        if ($Answer -ne [Windows.MessageBoxResult]::Yes) {
+            $EventArgs.Cancel = $true
+        }
+    }
+})
+
+# ---------------------------------------------------------------------------
+# Show the window
+# ---------------------------------------------------------------------------
+
+$sync.Form.ShowDialog() | Out-Null
+
+# Cleanup: stop and dispose any background task that is still around.
+if ($null -ne $sync.CurrentTask) {
+    try {
+        if (-not $sync.CurrentTask.Handle.IsCompleted) {
+            $sync.CurrentTask.PS.Stop()
+        }
+        $sync.CurrentTask.PS.Dispose()
+        $sync.CurrentTask.Runspace.Dispose()
+    }
+    catch { }
+}
+
+if ($PSCommandPath) { exit 0 }
