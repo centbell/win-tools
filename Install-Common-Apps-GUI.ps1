@@ -94,6 +94,11 @@ $sync.CategoryPanels = @{}
 $sync.ColumnCount = 3
 $sync.ButtonsVertical = $false
 $sync.CurrentTask = $null
+# Exit code reported by a package's own installer/uninstaller, scraped from the
+# WinGet output. WinGet wraps it in a generic code of its own, so this is the
+# only number that says what actually went wrong. Pre-created so strict mode
+# never sees a missing key.
+$sync.LastInstallerExit = $null
 
 $LogDirectory = Join-Path $env:TEMP "Winget-App-Installer"
 New-Item -Path $LogDirectory -ItemType Directory -Force | Out-Null
@@ -380,6 +385,7 @@ function Invoke-ProcessStreaming {
     )
 
     $LastLine = ""
+    $sync.LastInstallerExit = $null
 
     & $FilePath @Arguments 2>&1 | ForEach-Object {
         $Line = $_.ToString()
@@ -391,6 +397,14 @@ function Invoke-ProcessStreaming {
         $Line = $Line.Trim()
 
         if ($Line -eq "") { return }
+
+        # WinGet reports the package's own failure as e.g. "Uninstall failed
+        # with exit code: 15" and then returns a generic code of its own. Keep
+        # the inner number so the summary can name the real cause.
+        if ($Line -match "exit code:\s*(-?\d+)") {
+            $sync.LastInstallerExit = $Matches[1]
+        }
+
         if ($Line -match "^[\-\\\|\/\s]+$") { return }
         # U+2588/2592/2591 are the block characters winget draws its progress
         # bar with. Written as regex escapes so this file stays pure ASCII and
@@ -472,6 +486,7 @@ function Invoke-AppAction {
     $Succeeded = New-Object System.Collections.Generic.List[string]
     $Skipped = New-Object System.Collections.Generic.List[string]
     $Failed = New-Object System.Collections.Generic.List[string]
+    $ScopeConflict = $false
 
     foreach ($App in $Apps) {
         $AppType = Get-AppType -App $App
@@ -615,6 +630,32 @@ function Invoke-AppAction {
             $Skipped.Add($App.Name)
             Set-AppStatus -Id $App.Id -State "Installed"
         }
+        elseif ($ExitCode -eq -1978335107) {
+            # 0x8A15007D: the package lives in this user's own profile, and an
+            # elevated process runs as Administrator rather than as that user,
+            # so WinGet refuses to touch it. Elevation is the cause, not the cure.
+            Write-GuiLog "ERROR: $($App.Name) is installed for your user account, so WinGet will not $($Action.ToLower()) it from an Administrator session."
+            $Failed.Add("$($App.Name) (needs a non-Administrator session)")
+            $ScopeConflict = $true
+            Set-AppStatus -Id $App.Id -State "Installed"
+        }
+        elseif ($ExitCode -eq -1978335184) {
+            # 0x8A150030: WinGet handed off to the package's own uninstaller and
+            # that failed. WinGet's code is the same every time, so the useful
+            # number is the inner one scraped by Invoke-ProcessStreaming.
+            if ($sync.LastInstallerExit) {
+                Write-GuiLog "WARNING: $($App.Name) could not be removed - its own uninstaller returned exit code $($sync.LastInstallerExit)."
+            }
+            else {
+                Write-GuiLog "WARNING: $($App.Name) could not be removed - its own uninstaller failed. See the lines above for its message."
+            }
+
+            Write-GuiLog "  If the app no longer starts and its folder is gone, it was already removed and only a leftover"
+            Write-GuiLog "  Add/Remove Programs entry remains. Reinstalling it, then uninstalling again, clears that up."
+
+            $Failed.Add("$($App.Name) (uninstaller failed)")
+            Set-AppStatus -Id $App.Id -State "Installed"
+        }
         else {
             Write-GuiLog "WARNING: $($App.Name) failed with WinGet exit code $ExitCode."
 
@@ -639,6 +680,10 @@ function Invoke-AppAction {
     if ($Succeeded.Count -gt 0) { Write-GuiLog ("  + " + ($Succeeded -join ", ")) -NoTimestamp }
     if ($Skipped.Count -gt 0) { Write-GuiLog ("  = " + ($Skipped -join ", ")) -NoTimestamp }
     if ($Failed.Count -gt 0) { Write-GuiLog ("  - " + ($Failed -join ", ")) -NoTimestamp }
+
+    if ($ScopeConflict) {
+        Write-GuiLog "Close this tool, open PowerShell WITHOUT 'Run as administrator', start it again, and retry those apps."
+    }
 
     Write-GuiLog "Log file: $($sync.LogFile)"
     Set-UiBusy $false "Ready"

@@ -24,6 +24,18 @@ The tool starts without elevation and will show you what is installed, but:
 Right-click PowerShell or Windows Terminal and choose **Run as administrator**
 before launching. The log panel warns you at startup when you are not elevated.
 
+### One case where you must *not* be Administrator
+
+**Uninstalling** an app that was installed for your user account only — most
+browsers and chat apps put themselves in your own profile rather than in
+`Program Files` — fails from an elevated window. An elevated session runs as
+Administrator instead of as you, so WinGet refuses to touch your personal
+installation and reports exit code `-1978335107`.
+
+There is no single session that covers both jobs. Use an ordinary,
+non-elevated PowerShell window to remove those apps, and an elevated one for
+Windows Features and machine-wide packages.
+
 ---
 
 ## Running the tool
@@ -227,9 +239,50 @@ Normal for Windows Features. Reboot when convenient; the feature completes then.
 
 **An app says it failed with an exit code**
 Common WinGet outcomes are handled and reported as skips rather than errors:
-another version already installed, or nothing to upgrade. Anything else is a
-genuine installer failure — the log shows WinGet's own output just above the
-error line, which usually explains it.
+another version already installed, or nothing to upgrade. Two failures get a
+plain-English explanation instead of a bare number — see the two entries below.
+Anything else is a genuine installer failure — the log shows WinGet's own output
+just above the error line, which usually explains it.
+
+**"is installed for your user account" / exit code `-1978335107`**
+You are running elevated and the app lives in your own user profile. Close the
+tool, open PowerShell **without** *Run as administrator*, start it again and
+retry. See "One case where you must not be Administrator" above.
+
+**"its own uninstaller returned exit code N" / exit code `-1978335184`**
+WinGet found the app and handed off to the app's own uninstaller, which then
+failed. The number the tool prints is the one that uninstaller reported —
+WinGet's own code is the same for every such failure. Most often the app was
+already removed by hand and only its Add/Remove Programs entry survives, which
+is also why the tool still lists it as installed. Chromium-based browsers
+report `15` in that situation.
+
+The easy fix is to install the app again and then uninstall it, which rewrites
+and then removes the registration properly. To clear the leftover entry instead,
+find it and delete it:
+
+```powershell
+$keys = @(
+    'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall',
+    'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+    'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+) | ForEach-Object { Get-ChildItem $_ -ErrorAction SilentlyContinue } |
+    Where-Object { $_.GetValue('DisplayName') -like '*NAME*' }
+
+$keys | ForEach-Object { '{0} -> {1}' -f $_.GetValue('DisplayName'), $_.Name }
+```
+
+Replace `NAME` with part of the app's name, check that only the intended app is
+listed, then remove those keys — `HKLM` ones need an elevated window:
+
+```powershell
+$keys | ForEach-Object {
+    Remove-Item -LiteralPath ($_.Name -replace '^HKEY_CURRENT_USER', 'HKCU:' -replace '^HKEY_LOCAL_MACHINE', 'HKLM:') -Recurse -Force
+}
+```
+
+A dead Start menu shortcut may also be left behind; delete it from
+`%APPDATA%\Microsoft\Windows\Start Menu\Programs`.
 
 **Adobe Acrobat Reader fails with 1603**
 Almost always an existing Acrobat or Reader installation conflicting. Check
