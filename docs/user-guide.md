@@ -122,9 +122,32 @@ vertically when the window gets narrow. Resize it however suits you.
 | **Update**         | Upgrades every ticked app. Apps that are not installed are skipped.                  |
 | **Update All**     | Upgrades everything currently detected as installed. Ignores the checkboxes.         |
 | **Refresh Status** | Re-runs detection for the whole list.                                                |
+| **Clean Leftovers**| Finds apps listed as installed whose files are gone, and clears the stale entries.   |
 
 While a task runs, the buttons disable and the status text on the right shows
 the current app. Closing the window mid-task asks for confirmation.
+
+### Clean Leftovers
+
+An app removed by hand — or by an installer that did not finish the job — often
+leaves its **Add/Remove Programs** entry behind. Windows, WinGet and this tool
+all still believe it is installed, and uninstalling it fails, because the real
+uninstaller is already gone.
+
+**Clean Leftovers** scans the apps in the list, compares each registration
+against the folder it claims to occupy, and reports every one whose files have
+vanished. It then shows you the list and asks before changing anything. If you
+agree, it deletes those Add/Remove Programs entries, plus any Start menu or
+desktop shortcut that pointed into the missing folder, and re-runs detection.
+
+It is deliberately cautious. An entry is only treated as a leftover when it
+names a location on disk **and** that location no longer exists — anything it
+cannot prove is left untouched, so nothing you actually use will be flagged.
+Entries registered machine-wide need the tool running as Administrator; it says
+so in the log rather than failing silently.
+
+Deleting a registry entry cannot be undone, so read the confirmation list before
+accepting it.
 
 ---
 
@@ -257,9 +280,11 @@ already removed by hand and only its Add/Remove Programs entry survives, which
 is also why the tool still lists it as installed. Chromium-based browsers
 report `15` in that situation.
 
-The easy fix is to install the app again and then uninstall it, which rewrites
-and then removes the registration properly. To clear the leftover entry instead,
-find it and delete it:
+Press **Clean Leftovers** — it detects exactly this case and clears the stale
+entry for you. Installing the app again and then uninstalling it also works,
+since that rewrites and then removes the registration properly.
+
+To do it by hand instead, find the entry and delete it:
 
 ```powershell
 $keys = @(
@@ -290,6 +315,10 @@ Settings > Apps for an existing Adobe Acrobat entry and remove it first.
 
 **"WinGet was not found"**
 Install **App Installer** from the Microsoft Store, then reopen the tool.
+
+**An app shows as installed but it will not start and its folder is gone**
+It was removed without its registration being cleaned up. Press **Clean
+Leftovers**, check the list it offers, and accept.
 
 **An app shows as not installed but you know it is there**
 Detection matches WinGet package IDs, installed program names, and Store package

@@ -112,6 +112,8 @@ $sync.CurrentTask = $null
 # only number that says what actually went wrong. Pre-created so strict mode
 # never sees a missing key.
 $sync.LastInstallerExit = $null
+# Answer from a MessageBox the background runspace raised through the dispatcher.
+$sync.ConfirmResult = "No"
 
 $LogDirectory = Join-Path $env:TEMP "Winget-App-Installer"
 New-Item -Path $LogDirectory -ItemType Directory -Force | Out-Null
@@ -337,7 +339,7 @@ function Set-UiBusy {
     $sync.ProcessRunning = $Busy
 
     $sync.Form.Dispatcher.Invoke([action]{
-        foreach ($ButtonName in @("InstallBtn", "UninstallBtn", "UpdateBtn", "UpdateAllBtn", "RefreshBtn")) {
+        foreach ($ButtonName in @("InstallBtn", "UninstallBtn", "UpdateBtn", "UpdateAllBtn", "RefreshBtn", "CleanBtn")) {
             $sync[$ButtonName].IsEnabled = -not $Busy
         }
 
@@ -703,6 +705,262 @@ function Invoke-AppAction {
 }
 
 # ---------------------------------------------------------------------------
+# Leftover cleanup (runs inside the background runspace)
+#
+# An app removed by hand, or by an installer that did not finish the job, often
+# leaves its Add/Remove Programs entry behind. WinGet still lists it, this tool
+# still shows it as installed, and uninstalling fails because the real
+# uninstaller is already gone. The entry has to be deleted directly.
+#
+# Deleting registry keys is not undoable, so the rule here is deliberately
+# strict: an entry is a leftover only when it names a location on disk and that
+# location no longer exists. An entry we cannot prove anything about is left
+# alone rather than guessed at.
+# ---------------------------------------------------------------------------
+
+function Get-EntryValue {
+    param(
+        [Parameter(Mandatory = $true)]
+        $Entry,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Name
+    )
+
+    # Registry entries omit properties freely and Set-StrictMode makes a direct
+    # read throw, so every value goes through here.
+    $Property = $Entry.PSObject.Properties[$Name]
+
+    if ($null -eq $Property -or $null -eq $Property.Value) {
+        return ""
+    }
+
+    return [string]$Property.Value
+}
+
+function Get-UninstallExePath {
+    param(
+        [AllowNull()]
+        [string]$UninstallString
+    )
+
+    if ([string]::IsNullOrWhiteSpace($UninstallString)) {
+        return ""
+    }
+
+    $Text = $UninstallString.Trim()
+
+    if ($Text.StartsWith('"')) {
+        $Closing = $Text.IndexOf('"', 1)
+
+        if ($Closing -gt 1) {
+            return $Text.Substring(1, $Closing - 1)
+        }
+
+        return ""
+    }
+
+    # MsiExec /X{GUID} names a product code rather than a file, and msiexec.exe
+    # itself always exists, so it proves nothing either way.
+    if ($Text -match "^(?i)msiexec") {
+        return ""
+    }
+
+    if ($Text -match "^(?<Path>[A-Za-z]:\\[^`"]+?\.exe)") {
+        return $Matches.Path
+    }
+
+    return ""
+}
+
+function Get-AppLeftovers {
+    $Entries = @(Get-UninstallEntries)
+    $Leftovers = New-Object System.Collections.Generic.List[object]
+    $SeenKeys = New-Object System.Collections.Generic.List[string]
+
+    foreach ($App in $sync.Apps) {
+        # Windows features are not registered in Add/Remove Programs.
+        if ((Get-AppType -App $App) -eq "Feature") { continue }
+        if (@($App.DetectNames).Count -eq 0) { continue }
+
+        foreach ($Entry in $Entries) {
+            $DisplayName = Get-EntryValue -Entry $Entry -Name "DisplayName"
+            $Matched = $false
+
+            foreach ($Pattern in $App.DetectNames) {
+                if ($DisplayName -like $Pattern) {
+                    $Matched = $true
+                    break
+                }
+            }
+
+            if (-not $Matched) { continue }
+
+            $KeyPath = Get-EntryValue -Entry $Entry -Name "PSPath"
+            if ($KeyPath -eq "" -or $SeenKeys.Contains($KeyPath)) { continue }
+
+            $InstallLocation = (Get-EntryValue -Entry $Entry -Name "InstallLocation").Trim('"').TrimEnd('\')
+            $ExePath = Get-UninstallExePath -UninstallString (Get-EntryValue -Entry $Entry -Name "UninstallString")
+
+            $ProbePaths = New-Object System.Collections.Generic.List[string]
+            if ($InstallLocation -ne "") { $ProbePaths.Add($InstallLocation) }
+            if ($ExePath -ne "") { $ProbePaths.Add($ExePath) }
+
+            # Nothing on disk to check means nothing to prove. Leave it.
+            if ($ProbePaths.Count -eq 0) { continue }
+
+            $StillThere = $false
+            foreach ($ProbePath in $ProbePaths) {
+                if (Test-Path -LiteralPath $ProbePath) {
+                    $StillThere = $true
+                    break
+                }
+            }
+
+            if ($StillThere) { continue }
+
+            $SeenKeys.Add($KeyPath)
+            $Leftovers.Add([PSCustomObject]@{
+                Name            = $App.Name
+                DisplayName     = $DisplayName
+                KeyPath         = $KeyPath
+                InstallLocation = $InstallLocation
+                MissingPath     = $ProbePaths[0]
+            })
+        }
+    }
+
+    return $Leftovers
+}
+
+function Remove-DeadShortcut {
+    param(
+        [Parameter(Mandatory = $true)]
+        [PSCustomObject]$Leftover
+    )
+
+    # Without a known install folder there is no safe way to tell this app's
+    # shortcuts from anyone else's, so leave them all alone.
+    if ($Leftover.InstallLocation -eq "") { return }
+
+    $Root = $Leftover.InstallLocation
+
+    try {
+        $Shell = New-Object -ComObject WScript.Shell
+    }
+    catch {
+        Write-GuiLog "WARNING: could not inspect shortcuts for $($Leftover.Name)."
+        return
+    }
+
+    $Folders = @(
+        (Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs"),
+        (Join-Path $env:ProgramData "Microsoft\Windows\Start Menu\Programs"),
+        [Environment]::GetFolderPath("Desktop"),
+        (Join-Path $env:PUBLIC "Desktop")
+    )
+
+    foreach ($Folder in $Folders) {
+        if (-not (Test-Path -LiteralPath $Folder)) { continue }
+
+        foreach ($Link in @(Get-ChildItem -LiteralPath $Folder -Recurse -Filter "*.lnk" -ErrorAction SilentlyContinue)) {
+            $Target = ""
+
+            try {
+                $Target = [string]$Shell.CreateShortcut($Link.FullName).TargetPath
+            }
+            catch {
+                continue
+            }
+
+            # Two conditions, both required: it points into the folder that
+            # vanished, and its target really is gone.
+            if ([string]::IsNullOrWhiteSpace($Target)) { continue }
+            if (-not $Target.StartsWith($Root, [StringComparison]::OrdinalIgnoreCase)) { continue }
+            if (Test-Path -LiteralPath $Target) { continue }
+
+            try {
+                Remove-Item -LiteralPath $Link.FullName -Force -ErrorAction Stop
+                Write-GuiLog "  Removed dead shortcut: $($Link.Name)"
+            }
+            catch {
+                Write-GuiLog "  WARNING: could not remove shortcut $($Link.FullName)."
+            }
+        }
+    }
+
+    try {
+        [void][Runtime.InteropServices.Marshal]::ReleaseComObject($Shell)
+    }
+    catch { }
+}
+
+function Invoke-LeftoverCleanup {
+    Set-UiBusy $true "Scanning for leftovers..."
+    Write-GuiLog ("=" * 60) -NoTimestamp
+    Write-GuiLog "Scanning for leftover Add/Remove Programs entries..."
+
+    $Leftovers = @(Get-AppLeftovers)
+
+    if ($Leftovers.Count -eq 0) {
+        Write-GuiLog "No leftovers found. Everything listed as installed has its files in place."
+        Set-UiBusy $false "Ready"
+        return
+    }
+
+    foreach ($Leftover in $Leftovers) {
+        Write-GuiLog "Leftover: $($Leftover.DisplayName) - registered as installed, but $($Leftover.MissingPath) does not exist."
+    }
+
+    $Summary = ($Leftovers | ForEach-Object { "  - " + $_.DisplayName }) -join "`n"
+
+    # MessageBox has to be raised on the UI thread; Invoke is synchronous, so
+    # the answer is waiting in $sync by the time it returns.
+    $sync.ConfirmResult = "No"
+    $sync.Form.Dispatcher.Invoke([action]{
+        $sync.ConfirmResult = [Windows.MessageBox]::Show(
+            ("These apps are listed as installed, but their files are gone:`n`n{0}`n`n" -f $Summary) +
+            "Remove their Add/Remove Programs entries and any dead shortcuts?`n`n" +
+            "This deletes registry entries and cannot be undone.",
+            "Common Apps Manager", "YesNo", "Warning"
+        )
+    }.GetNewClosure())
+
+    if ("$($sync.ConfirmResult)" -ne "Yes") {
+        Write-GuiLog "Cleanup cancelled. Nothing was removed."
+        Set-UiBusy $false "Ready"
+        return
+    }
+
+    $Removed = 0
+
+    foreach ($Leftover in $Leftovers) {
+        Set-UiBusy $true "Cleaning : $($Leftover.DisplayName)"
+
+        try {
+            Remove-Item -LiteralPath $Leftover.KeyPath -Recurse -Force -ErrorAction Stop
+            Write-GuiLog "Removed the Add/Remove Programs entry for $($Leftover.DisplayName)."
+            $Removed++
+        }
+        catch {
+            if ($Leftover.KeyPath -like "*HKEY_LOCAL_MACHINE*" -and -not $sync.IsAdministrator) {
+                Write-GuiLog "ERROR: $($Leftover.DisplayName) is registered machine-wide. Restart this tool as Administrator to clean it."
+            }
+            else {
+                Write-GuiLog "ERROR: could not remove the entry for $($Leftover.DisplayName): $($_.Exception.Message)"
+            }
+
+            continue
+        }
+
+        Remove-DeadShortcut -Leftover $Leftover
+    }
+
+    Write-GuiLog "Cleanup complete. Removed $Removed of $($Leftovers.Count) leftover entries."
+    Update-InstalledStatus
+}
+
+# ---------------------------------------------------------------------------
 # Background runspace plumbing
 # ---------------------------------------------------------------------------
 
@@ -718,7 +976,12 @@ $FunctionsToShare = @(
     "Invoke-ProcessStreaming",
     "Invoke-WingetStreaming",
     "Update-InstalledStatus",
-    "Invoke-AppAction"
+    "Invoke-AppAction",
+    "Get-EntryValue",
+    "Get-UninstallExePath",
+    "Get-AppLeftovers",
+    "Remove-DeadShortcut",
+    "Invoke-LeftoverCleanup"
 )
 
 $InitialSessionState = [InitialSessionState]::CreateDefault()
@@ -895,7 +1158,8 @@ $XamlString = @'
                 <Button x:Name="UninstallBtn" Content="Uninstall" Width="110" Margin="0,0,10,0"/>
                 <Button x:Name="UpdateBtn" Content="Update" Width="110" Margin="0,0,10,0"/>
                 <Button x:Name="UpdateAllBtn" Content="Update All" Width="110" Margin="0,0,10,0"/>
-                <Button x:Name="RefreshBtn" Content="Refresh Status" Width="130"/>
+                <Button x:Name="RefreshBtn" Content="Refresh Status" Width="130" Margin="0,0,10,0"/>
+                <Button x:Name="CleanBtn" Content="Clean Leftovers" Width="140"/>
             </StackPanel>
         </DockPanel>
     </Grid>
@@ -909,7 +1173,7 @@ $sync.Form = [Windows.Markup.XamlReader]::Load($XamlNodeReader)
 foreach ($ControlName in @(
     "SearchBox", "SearchHint", "SelectAllBtn", "ClearBtn", "AppsPanel",
     "LogBox", "InstallBtn", "UninstallBtn", "UpdateBtn", "UpdateAllBtn",
-    "RefreshBtn", "StatusText", "ButtonsPanel"
+    "RefreshBtn", "CleanBtn", "StatusText", "ButtonsPanel"
 )) {
     $sync[$ControlName] = $sync.Form.FindName($ControlName)
 }
@@ -1045,7 +1309,7 @@ function Update-ResponsiveLayout {
             $ButtonMargin = "0,0,10,0"
         }
 
-        foreach ($ButtonName in @("InstallBtn", "UninstallBtn", "UpdateBtn", "UpdateAllBtn", "RefreshBtn")) {
+        foreach ($ButtonName in @("InstallBtn", "UninstallBtn", "UpdateBtn", "UpdateAllBtn", "RefreshBtn", "CleanBtn")) {
             $sync[$ButtonName].Margin = $ButtonMargin
         }
     }
@@ -1165,6 +1429,12 @@ $sync.UpdateAllBtn.Add_Click({
 $sync.RefreshBtn.Add_Click({
     if (-not $sync.ProcessRunning) {
         Start-BackgroundTask -Command "Update-InstalledStatus"
+    }
+})
+
+$sync.CleanBtn.Add_Click({
+    if (-not $sync.ProcessRunning) {
+        Start-BackgroundTask -Command "Invoke-LeftoverCleanup"
     }
 })
 
