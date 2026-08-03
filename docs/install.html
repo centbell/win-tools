@@ -40,8 +40,11 @@
   <pre>irm https://win.knk24.com | iex</pre>
 
   <div class="warn">
-    Run as Administrator. Machine-wide installers and Windows Features such as
-    .NET Framework 3.5 cannot be installed without it.
+    Run as Administrator to install. Machine-wide installers and Windows Features
+    such as .NET Framework 3.5 cannot be installed without it. To
+    <em>uninstall</em> an app that lives in your own user profile, such as most
+    browsers, run it <em>without</em> Administrator instead &mdash; WinGet
+    refuses to remove those from an elevated session.
   </div>
 
   <h2>What it does</h2>
@@ -49,6 +52,7 @@
     <li>Shows every app in the list with its current installed status.</li>
     <li>Tick what you want, then Install, Uninstall, or Update.</li>
     <li>Update All upgrades everything already installed.</li>
+    <li>Clean Leftovers clears stale Add/Remove Programs entries for apps whose files are already gone.</li>
     <li>Live output in the window, plus a log in <code>%TEMP%\Winget-App-Installer</code>.</li>
   </ul>
 
